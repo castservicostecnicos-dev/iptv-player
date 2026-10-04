@@ -3,6 +3,9 @@ import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
+// Desabilita rejeição estrita de certificados SSL auto-assinados comuns em provedores IPTV
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -26,8 +29,48 @@ setInterval(() => {
   }
 }, 30000);
 
-// Parser M3U simples e rápido para servidor
-function parseM3uOnServer(content: string, cleanUrl: string, username: string, password: string) {
+/**
+ * Normaliza e extrai Host, Usuário e Senha caso o usuário tenha colado uma URL completa
+ */
+function normalizeXtreamCredentials(rawUrl: string, rawUser?: string, rawPass?: string) {
+  let url = rawUrl.trim();
+  let user = (rawUser || '').trim();
+  let pass = (rawPass || '').trim();
+
+  // Adiciona http se faltar
+  if (!url.startsWith('http://') && !url.startsWith('https://')) {
+    url = `http://${url}`;
+  }
+
+  try {
+    const parsed = new URL(url);
+    // Se o usuário colou a URL completa do get.php ou player_api.php com query params:
+    if (parsed.searchParams.has('username')) {
+      user = parsed.searchParams.get('username') || user;
+    }
+    if (parsed.searchParams.has('password')) {
+      pass = parsed.searchParams.get('password') || pass;
+    }
+
+    // Se o path contém /live/usuario/senha/...
+    const liveMatch = parsed.pathname.match(/\/live\/([^/]+)\/([^/]+)/);
+    if (liveMatch && !user && !pass) {
+      user = liveMatch[1];
+      pass = liveMatch[2];
+    }
+
+    // Limpa a URL base para apenas origin (http://servidor:porta)
+    const baseHost = `${parsed.protocol}//${parsed.host}`;
+    return { baseHost, user, pass };
+  } catch {
+    return { baseHost: url.replace(/\/+$/, ''), user, pass };
+  }
+}
+
+/**
+ * Parser M3U inteligente no servidor com suporte a #EXTGRP e conversão para .m3u8
+ */
+function parseM3uOnServer(content: string, baseHost: string) {
   const lines = content.split(/\r?\n/);
   const channels: any[] = [];
   const categoryMap = new Map<string, number>();
@@ -49,16 +92,29 @@ function parseM3uOnServer(content: string, cleanUrl: string, username: string, p
       currentGroup = groupMatch && groupMatch[1] ? groupMatch[1].trim() : 'Geral';
       currentLogo = logoMatch && logoMatch[1] ? logoMatch[1].trim() : '';
       currentTitle = commaIdx !== -1 ? line.substring(commaIdx + 1).trim() : `Canal ${chId}`;
-    } else if (!line.startsWith('#') && (line.startsWith('http://') || line.startsWith('https://'))) {
-      const streamId = `m3u_${chId}`;
+    } else if (line.startsWith('#EXTGRP:')) {
+      // Suporte a #EXTGRP presente em muitas listas brasileiras
+      const grp = line.replace('#EXTGRP:', '').trim();
+      if (grp) currentGroup = grp;
+    } else if (!line.startsWith('#') && (line.startsWith('http://') || line.startsWith('https://') || line.startsWith('/'))) {
+      let streamUrl = line;
+      if (streamUrl.startsWith('/')) {
+        streamUrl = `${baseHost}${streamUrl}`;
+      }
+
+      // Converte .ts para .m3u8 se for URL padrão Xtream Codes (/live/user/pass/id.ts)
+      if (streamUrl.includes('/live/') && streamUrl.endsWith('.ts')) {
+        streamUrl = streamUrl.replace(/\.ts$/, '.m3u8');
+      }
+
       channels.push({
         num: chId,
         name: currentTitle || `Canal ${chId}`,
         stream_type: 'live',
-        stream_id: streamId,
+        stream_id: `ch_${chId}`,
         stream_icon: currentLogo,
         category_id: currentGroup,
-        direct_source: line,
+        direct_source: streamUrl,
       });
 
       categoryMap.set(currentGroup, (categoryMap.get(currentGroup) || 0) + 1);
@@ -79,7 +135,9 @@ async function startServer() {
   const app = express();
   const PORT = process.env.PORT || 3000;
 
-  app.use(express.json());
+  // Aceita payloads maiores para listas M3U longas (até 50MB)
+  app.use(express.json({ limit: '50mb' }));
+  app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
   // Cabeçalhos CORS Globais
   app.use((req, res, next) => {
@@ -94,192 +152,188 @@ async function startServer() {
   });
 
   // ---------------------------------------------------------------------------
-  // 1. ENDPOINT DE AUTENTICAÇÃO XTREAM CODES VIA PROXY (Resiliente e Sem Erro de JSON)
+  // 1. ENDPOINT DE AUTENTICAÇÃO E CARREGAMENTO INTELIGENTE XTREAM / M3U
   // ---------------------------------------------------------------------------
   app.post('/api/iptv/auth', async (req: Request, res: Response) => {
     try {
       const { serverUrl, username, password } = req.body;
-      if (!serverUrl || !username || !password) {
-        return res.status(400).json({ error: 'Informe a URL do servidor, usuário e senha.' });
+      if (!serverUrl) {
+        return res.status(400).json({ error: 'Informe o endereço do servidor ou a URL da lista.' });
       }
 
-      // 1. Sanitização de URL (Garante protocolo http:// ou https://)
-      let cleanUrl = serverUrl.trim().replace(/\/+$/, '');
-      if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
-        cleanUrl = `http://${cleanUrl}`;
-      }
+      // Normaliza credenciais
+      const { baseHost, user, pass } = normalizeXtreamCredentials(serverUrl, username, password);
 
-      console.log(`[IPTV Auth Proxy] Autenticando usuário "${username}" em ${cleanUrl}`);
+      console.log(`[IPTV Auth] Tentando autenticar em "${baseHost}" com usuário "${user}"`);
 
-      const userAgents = [
-        'IPTVSmartersPro/1.1.1 (Linux; Android 9)',
-        'VLC/3.0.18 LibVLC/3.0.18',
-        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-      ];
+      // 1. TENTA PRIMEIRO VIA API XTREAM CODES (/player_api.php)
+      let authSuccess = false;
+      let userInfo: any = null;
+      let serverInfo: any = null;
+      let categories: any[] = [];
+      let streams: any[] = [];
+      let diagnosticLogs: string[] = [];
 
-      let rawAuthText = '';
-      let authResponseStatus = 200;
+      const headers = {
+        'User-Agent': 'IPTVSmartersPro/1.1.1 (Linux; Android 9)',
+        'Accept': '*/*',
+        'Connection': 'keep-alive',
+      };
 
-      // Tenta player_api.php com User-Agents conhecidos
-      for (const ua of userAgents) {
+      if (user && pass) {
+        const authUrl = `${baseHost}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}`;
+        diagnosticLogs.push(`Testando Xtream API: ${authUrl}`);
+
         try {
-          const authUrl = `${cleanUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
-          const response = await fetch(authUrl, {
-            headers: {
-              'User-Agent': ua,
-              'Accept': 'application/json, text/plain, */*',
-            },
+          const authRes = await fetch(authUrl, {
+            headers,
             redirect: 'follow',
+            signal: AbortSignal.timeout(15000),
           });
 
-          authResponseStatus = response.status;
-          rawAuthText = await response.text();
+          diagnosticLogs.push(`Status resposta Xtream: HTTP ${authRes.status}`);
 
-          // Se retornou conteúdo com mais de 5 caracteres, pode ser JSON válido
-          if (rawAuthText && rawAuthText.trim().length > 5) {
-            break;
+          if (authRes.ok) {
+            const text = await authRes.text();
+            if (text && text.trim().startsWith('{')) {
+              try {
+                const json = JSON.parse(text);
+                if (json.user_info && json.user_info.auth !== 0) {
+                  authSuccess = true;
+                  userInfo = json.user_info;
+                  serverInfo = json.server_info;
+                  diagnosticLogs.push(`Xtream API autenticada com sucesso! Status: ${userInfo.status}`);
+
+                  // Busca canais
+                  const streamRes = await fetch(`${baseHost}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&action=get_live_streams`, {
+                    headers,
+                    signal: AbortSignal.timeout(15000),
+                  });
+                  if (streamRes.ok) {
+                    const stText = await streamRes.text();
+                    if (stText.trim().startsWith('[')) {
+                      streams = JSON.parse(stText);
+                    }
+                  }
+
+                  // Busca categorias
+                  const catRes = await fetch(`${baseHost}/player_api.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&action=get_live_categories`, {
+                    headers,
+                    signal: AbortSignal.timeout(10000),
+                  });
+                  if (catRes.ok) {
+                    const catText = await catRes.text();
+                    if (catText.trim().startsWith('[')) {
+                      categories = JSON.parse(catText);
+                    }
+                  }
+                }
+              } catch (e: any) {
+                diagnosticLogs.push(`Erro decodificando JSON Xtream: ${e.message}`);
+              }
+            }
           }
-        } catch (fetchErr: any) {
-          console.warn(`[IPTV Auth] Falha com UA ${ua}:`, fetchErr.message);
+        } catch (xtreamErr: any) {
+          diagnosticLogs.push(`Falha de conexão em player_api.php: ${xtreamErr.message}`);
         }
       }
 
-      // Tenta decodificar o JSON com segurança
-      let data: any = null;
-      if (rawAuthText && rawAuthText.trim().startsWith('{')) {
-        try {
-          data = JSON.parse(rawAuthText);
-        } catch {
-          data = null;
-        }
-      }
+      // 2. SE XTREAM FALHOU OU SE FOR LINK M3U DIRETO, TENTA /get.php
+      if (!authSuccess && user && pass) {
+        const m3uPlusUrl = `${baseHost}/get.php?username=${encodeURIComponent(user)}&password=${encodeURIComponent(pass)}&type=m3u_plus&output=m3u8`;
+        diagnosticLogs.push(`Tentando fallback M3U Plus: ${m3uPlusUrl}`);
 
-      // SE O SERVIDOR RETORNOU VAZIO OU NÃO-JSON EM player_api.php:
-      // Tenta automaticamente o formato M3U Plus via get.php!
-      if (!data || !data.user_info) {
-        console.log(`[IPTV Auth Proxy] player_api.php não retornou JSON. Tentando fallback via get.php (M3U Plus)...`);
-
-        const m3uPlusUrl = `${cleanUrl}/get.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&type=m3u_plus&output=m3u8`;
         try {
           const m3uRes = await fetch(m3uPlusUrl, {
-            headers: { 'User-Agent': 'IPTVSmartersPro/1.1.1' },
+            headers,
             redirect: 'follow',
+            signal: AbortSignal.timeout(20000),
           });
 
-          if (m3uRes.ok) {
-            const m3uText = await m3uRes.text();
-            if (m3uText.includes('#EXTM3U') || m3uText.includes('#EXTINF')) {
-              console.log(`[IPTV Auth Proxy] Fallback get.php teve sucesso! Processando canais M3U.`);
-              const { channels, categories } = parseM3uOnServer(m3uText, cleanUrl, username, password);
+          diagnosticLogs.push(`Status resposta get.php: HTTP ${m3uRes.status}`);
 
-              return res.json({
-                success: true,
-                userInfo: {
-                  status: 'Active',
-                  exp_date: 'Ativo (Via M3U Plus)',
-                  max_connections: '1',
-                  active_cons: '1',
-                  message: 'Acesso validado com sucesso via M3U Plus',
-                },
-                serverInfo: {
-                  url: cleanUrl,
-                  port: '80',
-                  server_protocol: cleanUrl.startsWith('https') ? 'https' : 'http',
-                  timezone: 'UTC',
-                },
-                categories,
-                streams: channels,
-              });
+          if (m3uRes.ok) {
+            const m3uContent = await m3uRes.text();
+            if (m3uContent.includes('#EXTM3U') || m3uContent.includes('#EXTINF')) {
+              diagnosticLogs.push(`Lista M3U recebida com sucesso! Tamanho: ${m3uContent.length} bytes`);
+              const parsed = parseM3uOnServer(m3uContent, baseHost);
+              authSuccess = true;
+              streams = parsed.channels;
+              categories = parsed.categories;
+              userInfo = {
+                status: 'Active',
+                exp_date: 'Ativo (Via Lista M3U Plus)',
+                max_connections: '1',
+                active_cons: '1',
+              };
+              serverInfo = { url: baseHost };
+            } else {
+              diagnosticLogs.push(`Resposta de get.php não continha cabeçalhos M3U válidos: ${m3uContent.substring(0, 100)}`);
             }
           }
         } catch (m3uErr: any) {
-          console.warn('[IPTV Auth Proxy] Fallback get.php falhou:', m3uErr.message);
+          diagnosticLogs.push(`Falha de conexão em get.php: ${m3uErr.message}`);
         }
+      }
 
-        // Se chegou aqui e tem HTML na resposta:
-        if (rawAuthText && (rawAuthText.includes('<!DOCTYPE') || rawAuthText.includes('<html'))) {
-          return res.status(400).json({
-            error: 'O endereço informado retornou uma página web (HTML) em vez da API de IPTV. Verifique se o endereço (ex: http://servidor:porta), o usuário e a senha estão corretos.',
+      // 3. SE O USUÁRIO FORNECEU UMA URL DIRETA DE LISTA M3U (ex: bit.ly ou URL personalizada)
+      if (!authSuccess && serverUrl.startsWith('http')) {
+        diagnosticLogs.push(`Tentando baixar como URL direta: ${serverUrl}`);
+        try {
+          const directRes = await fetch(serverUrl, {
+            headers,
+            redirect: 'follow',
+            signal: AbortSignal.timeout(20000),
           });
-        }
 
-        // Se a resposta foi vazia:
-        if (!rawAuthText || rawAuthText.trim() === '') {
-          return res.status(400).json({
-            error: 'O servidor IPTV respondeu com corpo vazio. Isso ocorre quando o fornecedor bloqueia conexões diretas ou quando a porta está incorreta (ex: use http://seuservidor:8080 com a porta exata fornecida). Você também pode carregar sua lista na aba "Lista M3U / M3U8".',
-          });
-        }
-
-        return res.status(401).json({
-          error: `O servidor IPTV não reconheceu as credenciais (Resposta: "${rawAuthText.substring(0, 120)}"). Verifique usuário e senha.`,
-        });
-      }
-
-      // Se temos data.user_info do Xtream Codes:
-      if (data.user_info.auth === 0) {
-        return res.status(401).json({
-          error: 'Credenciais inválidas: usuário ou senha incorretos no fornecedor IPTV.',
-        });
-      }
-
-      // Busca Categorias de forma segura
-      let categories: any[] = [];
-      try {
-        const catRes = await fetch(`${cleanUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&action=get_live_categories`, {
-          headers: { 'User-Agent': 'IPTVSmartersPro/1.1.1' },
-          redirect: 'follow',
-        });
-        if (catRes.ok) {
-          const catText = await catRes.text();
-          if (catText && catText.trim().startsWith('[')) {
-            categories = JSON.parse(catText);
+          if (directRes.ok) {
+            const directText = await directRes.text();
+            if (directText.includes('#EXTM3U') || directText.includes('#EXTINF')) {
+              const parsed = parseM3uOnServer(directText, baseHost);
+              authSuccess = true;
+              streams = parsed.channels;
+              categories = parsed.categories;
+              userInfo = { status: 'Active', exp_date: 'Arquivo M3U Direto' };
+              serverInfo = { url: baseHost };
+            }
           }
+        } catch (dirErr: any) {
+          diagnosticLogs.push(`Falha ao obter URL direta: ${dirErr.message}`);
         }
-      } catch (e) {
-        console.warn('[IPTV Auth Proxy] Não foi possível obter categorias.');
       }
 
-      // Busca Canais ao Vivo de forma segura
-      let streams: any[] = [];
-      try {
-        const streamRes = await fetch(`${cleanUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}&action=get_live_streams`, {
-          headers: { 'User-Agent': 'IPTVSmartersPro/1.1.1' },
-          redirect: 'follow',
+      if (authSuccess) {
+        return res.json({
+          success: true,
+          userInfo: userInfo || { status: 'Active' },
+          serverInfo: serverInfo || { url: baseHost },
+          categories,
+          streams,
+          diagnosticLogs,
         });
-        if (streamRes.ok) {
-          const streamText = await streamRes.text();
-          if (streamText && streamText.trim().startsWith('[')) {
-            streams = JSON.parse(streamText);
-          }
-        }
-      } catch (e) {
-        console.warn('[IPTV Auth Proxy] Não foi possível obter lista de canais.');
       }
 
-      return res.json({
-        success: true,
-        userInfo: data.user_info,
-        serverInfo: data.server_info || { url: cleanUrl },
-        categories: Array.isArray(categories) ? categories : [],
-        streams: Array.isArray(streams) ? streams : [],
+      // Se falhou em todos:
+      console.warn('[IPTV Auth Failed] Logs:', diagnosticLogs);
+      return res.status(400).json({
+        error: 'Não foi possível validar as credenciais no servidor informado.',
+        diagnosticLogs,
+        suggestion: 'Dica: Se seu provedor usa bloqueio de IP ou portas não padrão, você pode copiar o texto da lista M3U e colar diretamente na aba "Lista M3U / M3U8" -> "Colar Texto", sem depender de conexão externa do servidor.',
       });
     } catch (err: any) {
-      console.error('[IPTV Auth Proxy Error]:', err.message);
-      return res.status(502).json({
-        error: `Não foi possível conectar ao fornecedor IPTV: ${err.message}. Verifique a URL e a porta.`,
+      return res.status(500).json({
+        error: `Erro interno no proxy: ${err.message}`,
       });
     }
   });
 
   // ---------------------------------------------------------------------------
-  // 2. ENDPOINT DE DOWNLOAD DE LISTA M3U VIA PROXY (Bypass CORS)
+  // 2. ENDPOINT DE DOWNLOAD DE LISTA M3U VIA PROXY
   // ---------------------------------------------------------------------------
   app.get('/api/iptv/m3u', async (req: Request, res: Response) => {
     try {
       const targetUrl = req.query.url as string;
-      if (!targetUrl) {
-        return res.status(400).send('URL da lista M3U é obrigatória.');
-      }
+      if (!targetUrl) return res.status(400).send('URL obrigatória');
 
       const response = await fetch(targetUrl, {
         headers: {
@@ -287,22 +341,23 @@ async function startServer() {
           'Accept': '*/*',
         },
         redirect: 'follow',
+        signal: AbortSignal.timeout(25000),
       });
 
       if (!response.ok) {
-        return res.status(response.status).send(`Erro ao baixar lista M3U: HTTP ${response.status}`);
+        return res.status(response.status).send(`Erro do servidor upstream: HTTP ${response.status}`);
       }
 
       const content = await response.text();
       res.setHeader('Content-Type', 'text/plain; charset=utf-8');
       return res.send(content);
     } catch (err: any) {
-      return res.status(502).send(`Falha no proxy ao obter lista M3U: ${err.message}`);
+      return res.status(502).send(`Falha ao baixar lista: ${err.message}`);
     }
   });
 
   // ---------------------------------------------------------------------------
-  // 3. PROXY DE STREAM HLS & SEGMENTOS COM CACHE EM RAM DISK
+  // 3. PROXY DE STREAM HLS & SEGMENTOS COM CACHE EM RAM
   // ---------------------------------------------------------------------------
   app.get('/api/iptv/proxy', async (req: Request, res: Response) => {
     const targetUrl = req.query.url as string;
@@ -310,10 +365,8 @@ async function startServer() {
       return res.status(400).send('Parâmetro url é obrigatório');
     }
 
-    const isManifest = targetUrl.includes('.m3u8') || targetUrl.includes('/live/');
     const isSegment = targetUrl.endsWith('.ts') || targetUrl.endsWith('.m4s') || targetUrl.endsWith('.mp4') || targetUrl.endsWith('.aac');
 
-    // Se for segmento de vídeo e já estiver em RAM:
     if (isSegment && ramChunkCache.has(targetUrl)) {
       const cached = ramChunkCache.get(targetUrl)!;
       res.setHeader('Content-Type', cached.contentType);
@@ -334,6 +387,7 @@ async function startServer() {
       const response = await fetch(targetUrl, {
         headers,
         redirect: 'follow',
+        signal: AbortSignal.timeout(15000),
       });
 
       if (!response.ok) {
@@ -343,14 +397,14 @@ async function startServer() {
       const contentType = response.headers.get('content-type') || 'application/octet-stream';
       res.status(response.status);
 
-      // Copia headers de Range / Tamanho
       ['content-length', 'content-range', 'accept-ranges'].forEach((h) => {
         const val = response.headers.get(h);
         if (val) res.setHeader(h, val);
       });
 
-      // Se for Manifest HLS (.m3u8), reescreve os links para passarem pelo proxy com CORS e HTTPS
-      if (isManifest || contentType.includes('mpegurl')) {
+      const isManifest = targetUrl.includes('.m3u8') || targetUrl.includes('/live/') || contentType.includes('mpegurl');
+
+      if (isManifest) {
         const manifestText = await response.text();
         const baseUrl = new URL(targetUrl);
 
@@ -366,7 +420,6 @@ async function startServer() {
             return line;
           }
 
-          // Linha com URL de chunk ou sub-manifest
           const resolvedSegmentUrl = new URL(trimmed, baseUrl).toString();
           return `/api/iptv/proxy?url=${encodeURIComponent(resolvedSegmentUrl)}`;
         });
@@ -377,7 +430,6 @@ async function startServer() {
         return res.send(rewrittenLines.join('\n'));
       }
 
-      // Se for segmento binário (.ts / .m4s), lê o buffer e salva em RAM
       const arrayBuffer = await response.arrayBuffer();
       const buffer = Buffer.from(arrayBuffer);
 
@@ -397,7 +449,7 @@ async function startServer() {
       res.setHeader('X-Cache-Status', isSegment ? 'MISS-CACHED-TO-RAM' : 'DIRECT');
       return res.send(buffer);
     } catch (err: any) {
-      console.error(`[IPTV Stream Proxy Error]: ${err.message} for ${targetUrl}`);
+      console.error(`[IPTV Stream Proxy Error]: ${err.message} para ${targetUrl}`);
       return res.status(502).send(`Falha ao obter stream: ${err.message}`);
     }
   });
