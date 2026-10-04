@@ -106,21 +106,39 @@ export function parseM3uContent(content: string, defaultCategory: string = 'Gera
 
 /**
  * Faz fetch de uma lista M3U a partir de uma URL
+ * Utiliza o proxy do servidor (/api/iptv/m3u) para evitar bloqueios de CORS e Mixed Content
  */
 export async function fetchM3uFromUrl(url: string): Promise<M3uParseResult> {
   const cleanUrl = url.trim();
-  const response = await fetch(cleanUrl, {
-    method: 'GET',
-    headers: {
-      'Accept': 'application/x-mpegurl, audio/x-mpegurl, text/plain, */*',
-    },
-  });
+  let content = '';
 
-  if (!response.ok) {
-    throw new Error(`Falha ao baixar lista M3U. Código de resposta: ${response.status}`);
+  // 1. Tenta baixar via proxy do servidor
+  try {
+    const proxyUrl = `/api/iptv/m3u?url=${encodeURIComponent(cleanUrl)}`;
+    const res = await fetch(proxyUrl);
+    if (res.ok) {
+      content = await res.text();
+    }
+  } catch (e) {
+    console.warn('[m3uParser] Falha no proxy, tentando download direto');
   }
 
-  const content = await response.text();
+  // 2. Se o proxy não respondeu, tenta fetch direto
+  if (!content) {
+    const response = await fetch(cleanUrl, {
+      method: 'GET',
+      headers: {
+        'Accept': 'application/x-mpegurl, audio/x-mpegurl, text/plain, */*',
+      },
+    });
+
+    if (!response.ok) {
+      throw new Error(`Falha ao baixar lista M3U. Código de resposta: ${response.status}`);
+    }
+
+    content = await response.text();
+  }
+
   if (!content.includes('#EXTM3U') && !content.includes('#EXTINF')) {
     throw new Error('O conteúdo baixado não parece ser uma lista M3U válida.');
   }

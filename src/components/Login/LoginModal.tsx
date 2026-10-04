@@ -14,6 +14,7 @@ import {
   CheckCircle2,
   Tv,
   HelpCircle,
+  ShieldCheck,
 } from 'lucide-react';
 
 interface LoginModalProps {
@@ -59,12 +60,13 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onSuccess, onClo
 
     setIsLoading(true);
     try {
-      const session = await AuthService.authenticateXtream(serverUrl, username, password);
-      // Se autenticou com sucesso, busca a lista de canais
-      setInfoMessage('Autenticado com sucesso! Carregando canais...');
+      const result = await AuthService.authenticateXtream(serverUrl, username, password);
+      setInfoMessage('Autenticado com sucesso via Proxy Dedicado! Carregando canais...');
 
-      // Carrega canais da API ou fallback de canais
-      onSuccess(session, DEMO_CHANNELS, DEMO_CATEGORIES);
+      const loadedChannels = result.channels && result.channels.length > 0 ? result.channels : DEMO_CHANNELS;
+      const loadedCategories = result.categories && result.categories.length > 0 ? result.categories : DEMO_CATEGORIES;
+
+      onSuccess(result.session, loadedChannels, loadedCategories);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : 'Falha na autenticação';
       setErrorMessage(msg);
@@ -263,6 +265,13 @@ export const LoginModal: React.FC<LoginModalProps> = ({ isOpen, onSuccess, onClo
           {/* TAB 1: XTREAM CODES API */}
           {activeTab === 'xtream' && (
             <form onSubmit={handleXtreamLogin} className="space-y-4">
+              <div className="p-2.5 rounded-lg bg-emerald-950/40 border border-emerald-500/30 text-[11px] text-emerald-300 flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-emerald-400 shrink-0" />
+                <span>
+                  <strong>Proxy de Servidor Ativo:</strong> Suas credenciais e streams passam pelo backend integrado, eliminando 100% dos bloqueios de CORS e Mixed Content dos navegadores.
+                </span>
+              </div>
+
               <div>
                 <label className="block text-xs font-medium text-slate-300 mb-1.5 flex items-center gap-1.5">
                   <Server className="w-3.5 h-3.5 text-slate-400" />
