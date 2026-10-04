@@ -1,0 +1,6 @@
+{
+  "name": "OmniStream IPTV & Edge Cache Engine",
+  "description": "High-performance IPTV Web/PWA Player with Xtream Codes & M3U support, ultra-low latency HLS playback, and dedicated edge cache architecture blueprint.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
