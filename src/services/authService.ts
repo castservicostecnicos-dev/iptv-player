@@ -67,7 +67,10 @@ export const AuthService = {
    * que elimina 100% dos bloqueios de CORS e Mixed Content dos navegadores!
    */
   async authenticateXtream(serverUrl: string, username: string, password: string): Promise<{ session: AuthSession; channels: Channel[]; categories: Category[] }> {
-    const cleanUrl = serverUrl.trim().replace(/\/+$/, '');
+    let cleanUrl = serverUrl.trim().replace(/\/+$/, '');
+    if (!cleanUrl.startsWith('http://') && !cleanUrl.startsWith('https://')) {
+      cleanUrl = `http://${cleanUrl}`;
+    }
 
     // 1. TENTA PRIMEIRO VIA PROXY DE SERVIDOR BACKEND (Elimina CORS e Mixed Content)
     try {
@@ -85,8 +88,15 @@ export const AuthService = {
       });
 
       if (proxyResponse.ok) {
-        const data = await proxyResponse.json();
-        if (data.success && data.userInfo) {
+        const rawText = await proxyResponse.text();
+        let data: any = null;
+        try {
+          data = JSON.parse(rawText);
+        } catch {
+          throw new Error('Resposta do servidor em formato inválido');
+        }
+
+        if (data && data.success && data.userInfo) {
           const session: AuthSession = {
             isAuthenticated: true,
             username: username.trim(),
@@ -96,7 +106,7 @@ export const AuthService = {
             loginTimestamp: Date.now(),
             userInfo: {
               status: data.userInfo.status || 'Active',
-              expDate: data.userInfo.exp_date ? new Date(parseInt(data.userInfo.exp_date, 10) * 1000).toLocaleDateString('pt-BR') : 'Ilimitado',
+              expDate: data.userInfo.exp_date ? (typeof data.userInfo.exp_date === 'string' && isNaN(Number(data.userInfo.exp_date)) ? data.userInfo.exp_date : new Date(parseInt(data.userInfo.exp_date, 10) * 1000).toLocaleDateString('pt-BR')) : 'Ilimitado',
               maxConnections: parseInt(data.userInfo.max_connections || '1', 10),
               activeCons: parseInt(data.userInfo.active_cons || '0', 10),
               message: data.userInfo.message,
@@ -106,7 +116,7 @@ export const AuthService = {
 
           // Converte streams para passar pelo proxy de HLS em RAM (/api/iptv/proxy)
           const channels: Channel[] = (data.streams || []).map((item: any, idx: number) => {
-            const rawStreamUrl = `${cleanUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${item.stream_id}.m3u8`;
+            const rawStreamUrl = item.direct_source || `${cleanUrl}/live/${encodeURIComponent(username)}/${encodeURIComponent(password)}/${item.stream_id}.m3u8`;
             return {
               id: String(item.stream_id || idx + 1),
               name: item.name || `Canal ${idx + 1}`,
@@ -135,32 +145,50 @@ export const AuthService = {
           return { session, channels, categories };
         }
       } else {
-        const errorData = await proxyResponse.json().catch(() => ({}));
+        const errorText = await proxyResponse.text().catch(() => '');
+        let errorData: any = {};
+        try {
+          if (errorText && errorText.trim().startsWith('{')) {
+            errorData = JSON.parse(errorText);
+          }
+        } catch {}
+
         if (errorData.error) {
           throw new Error(errorData.error);
         }
+        throw new Error(`Falha ao conectar ao servidor IPTV (HTTP ${proxyResponse.status})`);
       }
     } catch (proxyErr: any) {
-      console.warn('[AuthService] Tentativa de proxy backend falhou ou indisponível:', proxyErr.message);
-      // Se deu erro com mensagem explícita do fornecedor (ex: senha errada):
+      console.warn('[AuthService] Tentativa de proxy backend:', proxyErr.message);
       if (proxyErr.message && !proxyErr.message.includes('fetch') && !proxyErr.message.includes('NetworkError')) {
         throw proxyErr;
       }
     }
 
-    // 2. FALLBACK: Tenta requisição direta (caso o servidor IPTV remoto possua CORS ativo)
+    // 2. FALLBACK: Tenta requisição direta caso o proxy não esteja disponível
     const directApiUrl = `${cleanUrl}/player_api.php?username=${encodeURIComponent(username)}&password=${encodeURIComponent(password)}`;
     try {
       const response = await fetch(directApiUrl, {
         method: 'GET',
-        headers: { 'Accept': 'application/json' },
+        headers: { 'Accept': 'application/json, text/plain, */*' },
       });
 
       if (!response.ok) {
         throw new Error(`Servidor respondeu com código HTTP ${response.status}`);
       }
 
-      const data = await response.json();
+      const directText = await response.text();
+      if (!directText || directText.trim() === '') {
+        throw new Error('O servidor respondeu com corpo vazio. Verifique o endereço e a porta informados.');
+      }
+
+      let data: any = null;
+      try {
+        data = JSON.parse(directText);
+      } catch {
+        throw new Error('Resposta do fornecedor IPTV em formato inesperado.');
+      }
+
       if (!data.user_info || data.user_info.auth === 0) {
         throw new Error('Usuário ou senha inválidos no servidor IPTV informado.');
       }
@@ -186,7 +214,7 @@ export const AuthService = {
       if (errorMsg.includes('Failed to fetch') || errorMsg.includes('NetworkError')) {
         throw new Error(
           'O servidor do fornecedor bloqueou a conexão direta por política de CORS/Mixed Content. ' +
-          'O proxy integrado do servidor agora está ativo para retransmitir os streams.'
+          'Certifique-se de que a URL e a porta estão corretas (ex: http://seuservidor.com:8080).'
         );
       }
       throw new Error(errorMsg);
